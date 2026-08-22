@@ -477,14 +477,42 @@ export async function getCompanionAudioStartDelayMs(companionPath: string) {
 	return Math.round(startDelayMs ?? 0);
 }
 
-export async function hasEmbeddedAudioStream(videoPath: string) {
+export type AudioLoudnessInfo = {
+	hasStream: boolean;
+	meanVolumeDb: number | null;
+	maxVolumeDb: number | null;
+	isAudible: boolean;
+};
+
+const SILENCE_MAX_VOLUME_DB = -70;
+const EMBEDDED_AUDIO_LOUDNESS_PROBE_SECONDS = 5;
+
+/**
+ * Probe whether an audio file (or a video with an audio track) actually contains
+ * audible sound. The probe only analyzes the first few seconds to keep loading fast.
+ */
+export async function probeAudioLoudness(
+	filePath: string,
+	maxDurationSeconds = EMBEDDED_AUDIO_LOUDNESS_PROBE_SECONDS,
+): Promise<AudioLoudnessInfo> {
 	const ffmpegPath = getFfmpegBinaryPath();
 	let stderr = "";
 
 	try {
 		const result = await execFileAsync(
 			ffmpegPath,
-			["-hide_banner", "-i", videoPath, "-map", "0:a:0", "-frames:a", "1", "-f", "null", "-"],
+			[
+				"-hide_banner",
+				"-i",
+				filePath,
+				"-t",
+				String(maxDurationSeconds),
+				"-af",
+				"volumedetect",
+				"-f",
+				"null",
+				"-",
+			],
 			{ timeout: 20000, maxBuffer: 10 * 1024 * 1024 },
 		);
 		stderr = result.stderr;
@@ -492,7 +520,44 @@ export async function hasEmbeddedAudioStream(videoPath: string) {
 		stderr = (error as NodeJS.ErrnoException & { stderr?: string }).stderr ?? "";
 	}
 
-	return /Stream #.*Audio:/i.test(stderr);
+	const hasStreamFromProbe = /Stream #.*Audio:/i.test(stderr);
+	const hasVolumedetectOutput = /mean_volume:/i.test(stderr) && /max_volume:/i.test(stderr);
+	const hasStream = hasStreamFromProbe || hasVolumedetectOutput;
+	const meanMatch = stderr.match(/mean_volume:\s*([-\d.]+)\s*dB/i);
+	const maxMatch = stderr.match(/max_volume:\s*([-\d.]+)\s*dB/i);
+	const meanVolumeDb = meanMatch ? Number(meanMatch[1]) : null;
+	const maxVolumeDb = maxMatch ? Number(maxMatch[1]) : null;
+	const isAudible =
+		hasStream && maxVolumeDb !== null && Number.isFinite(maxVolumeDb) && maxVolumeDb > SILENCE_MAX_VOLUME_DB;
+
+	return { hasStream, meanVolumeDb, maxVolumeDb, isAudible };
+}
+
+export async function hasEmbeddedAudioStream(videoPath: string) {
+	const loudness = await probeAudioLoudness(videoPath);
+	return loudness.hasStream;
+}
+
+async function filterAudibleCompanionCandidates(
+	candidates: CompanionAudioCandidate[],
+): Promise<CompanionAudioCandidate[]> {
+	const filtered: CompanionAudioCandidate[] = [];
+
+	for (const candidate of candidates) {
+		const audiblePaths: string[] = [];
+		for (const companionPath of candidate.usablePaths) {
+			const loudness = await probeAudioLoudness(companionPath);
+			if (loudness.isAudible) {
+				audiblePaths.push(companionPath);
+			}
+		}
+
+		if (audiblePaths.length > 0) {
+			filtered.push({ ...candidate, usablePaths: audiblePaths });
+		}
+	}
+
+	return filtered;
 }
 
 export async function getCompanionAudioFallbackPaths(videoPath: string) {
@@ -506,16 +571,28 @@ export async function getCompanionAudioFallbackInfo(videoPath: string) {
 		return { paths: [], startDelayMsByPath: {} };
 	}
 
+	const embeddedLoudness = await probeAudioLoudness(videoPath);
+	const audibleCandidates = await filterAudibleCompanionCandidates(companionCandidates);
+
+	// If none of the sidecars contain audible audio, fall back to the embedded track
+	// when it has audible content. This avoids presenting silent sidecars as valid sources.
+	if (audibleCandidates.length === 0) {
+		return {
+			paths: embeddedLoudness.isAudible ? [videoPath] : [],
+			startDelayMsByPath: {},
+		};
+	}
+
 	let paths: string[];
-	if (await hasEmbeddedAudioStream(videoPath)) {
-		const hasUsableMacSystemCompanion = companionCandidates.some(
+	if (embeddedLoudness.isAudible) {
+		const hasUsableMacSystemCompanion = audibleCandidates.some(
 			(candidate) =>
 				candidate.platform === "mac" &&
 				candidate.usablePaths.includes(candidate.systemPath),
 		);
 		const usableMacMicOnlyCompanions = Array.from(
 			new Set(
-				companionCandidates.flatMap((candidate) =>
+				audibleCandidates.flatMap((candidate) =>
 					candidate.platform === "mac" &&
 					!candidate.usablePaths.includes(candidate.systemPath) &&
 					candidate.usablePaths.includes(candidate.micPath)
@@ -528,11 +605,19 @@ export async function getCompanionAudioFallbackInfo(videoPath: string) {
 		if (!hasUsableMacSystemCompanion && usableMacMicOnlyCompanions.length > 0) {
 			paths = usableMacMicOnlyCompanions;
 		} else if (hasUsableMacSystemCompanion) {
-			paths = [videoPath];
+			// macOS sidecars are the canonical split tracks. Prefer them over the embedded
+			// mix to avoid double-counting system audio during export/preview.
+			paths = Array.from(
+				new Set(
+					audibleCandidates
+						.filter((candidate) => candidate.platform === "mac")
+						.flatMap((candidate) => candidate.usablePaths),
+				),
+			);
 		} else {
 			const companionPaths = Array.from(
 				new Set(
-					companionCandidates.flatMap((candidate) =>
+					audibleCandidates.flatMap((candidate) =>
 						candidate.usablePaths.filter(
 							(companionPath) => companionPath === candidate.micPath,
 						),
@@ -547,7 +632,7 @@ export async function getCompanionAudioFallbackInfo(videoPath: string) {
 		}
 	} else {
 		paths = Array.from(
-			new Set(companionCandidates.flatMap((candidate) => candidate.usablePaths)),
+			new Set(audibleCandidates.flatMap((candidate) => candidate.usablePaths)),
 		);
 	}
 

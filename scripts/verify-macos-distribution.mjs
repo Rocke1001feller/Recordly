@@ -246,6 +246,7 @@ function verifyInfoPlist(appPath, label, check) {
 			"NSAudioCaptureUsageDescription",
 			"NSCameraUsageDescription",
 			"NSMicrophoneUsageDescription",
+			"NSScreenCaptureUsageDescription",
 		]) {
 			if (typeof info[usageKey] !== "string" || info[usageKey].trim().length === 0) {
 				errors.push(`${usageKey} is missing or empty`);
