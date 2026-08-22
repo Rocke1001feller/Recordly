@@ -76,7 +76,7 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			capturesMicrophone = false
 		}
 		writesSystemAudioToSeparateTrack = capturesSystemAudio
-		writesMicrophoneToSeparateTrack = capturesSystemAudio && capturesMicrophone
+		writesMicrophoneToSeparateTrack = capturesMicrophone
 		let requestedFPS = max(targetCaptureFPS, config.fps ?? targetCaptureFPS)
 		streamConfig.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(requestedFPS))
 		streamConfig.queueDepth = 6
@@ -657,12 +657,20 @@ guard CommandLine.arguments.count >= 2 else {
 let _ = CGMainDisplayID()
 
 // Pre-flight check: ensure screen recording permission is granted before
-// attempting capture. On macOS 15+, a one-session grant may expire after the
-// parent app restarts.  CGRequestScreenCaptureAccess() will trigger the
-// system-level permission dialog (or open System Settings) when not yet granted.
+// attempting capture. The parent Electron app already warms the TCC grant via
+// desktopCapturer.getSources(), so the helper normally inherits it. Prompting
+// from a bare CLI binary can create a separate, unstable TCC identity on macOS
+// 15, so we only prompt when explicitly opted-in.
 if !CGPreflightScreenCaptureAccess() {
-	let granted = CGRequestScreenCaptureAccess()
-	if !granted {
+	let allowPrompt = ProcessInfo.processInfo.environment["RECORDLY_HELPER_ALLOW_SCREEN_CAPTURE_PROMPT"] == "1"
+	if allowPrompt {
+		let granted = CGRequestScreenCaptureAccess()
+		if !granted {
+			fputs("SCREEN_RECORDING_PERMISSION_DENIED\n", stderr)
+			fflush(stderr)
+			exit(1)
+		}
+	} else {
 		fputs("SCREEN_RECORDING_PERMISSION_DENIED\n", stderr)
 		fflush(stderr)
 		exit(1)

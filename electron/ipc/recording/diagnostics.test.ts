@@ -5,6 +5,54 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 type ExecFileCallback = (error: Error | null, stdout?: string, stderr?: string) => void;
 
+function volumedetectStderr(meanDb: number, maxDb: number) {
+	return `[Parsed_volumedetect_0 @ 0x6000039b4000] mean_volume: ${meanDb.toFixed(1)} dB\n[Parsed_volumedetect_0 @ 0x6000039b4000] max_volume: ${maxDb.toFixed(1)} dB`;
+}
+
+function ffmpegProbeResponse(stderr: string) {
+	const error = new Error("ffmpeg probe") as Error & { stderr?: string };
+	error.stderr = stderr;
+	return error;
+}
+
+function mockFfmpeg(
+	execFileMock: ReturnType<typeof vi.fn>,
+	responses: {
+		videoPath: string;
+		embedded?: { hasStream: boolean; maxDb: number };
+		sidecarMaxDb?: number;
+	},
+) {
+	execFileMock.mockImplementation(
+		(_file: string, args: string[], _options: Record<string, unknown>, callback: ExecFileCallback) => {
+			const inputIndex = args.indexOf("-i");
+			const inputPath = inputIndex >= 0 ? args[inputIndex + 1] : undefined;
+			const isVideo = inputPath === responses.videoPath;
+			let stderr: string;
+
+			if (isVideo) {
+				const streamLine =
+					responses.embedded?.hasStream ?? false
+						? "Stream #0:1: Audio: aac"
+						: "Stream #0:0: Video: h264";
+				const loudness =
+					responses.embedded?.hasStream ?? false
+						? volumedetectStderr(
+								responses.embedded.maxDb - 10,
+								responses.embedded.maxDb,
+						  )
+						: "";
+				stderr = [streamLine, loudness].filter(Boolean).join("\n");
+			} else {
+				const maxDb = responses.sidecarMaxDb ?? -16;
+				stderr = volumedetectStderr(maxDb - 10, maxDb);
+			}
+
+			callback(ffmpegProbeResponse(stderr), "", stderr);
+		},
+	);
+}
+
 describe("getCompanionAudioFallbackPaths", () => {
 	let tempRoot: string;
 	let appDataPath: string;
@@ -79,18 +127,11 @@ describe("getCompanionAudioFallbackPaths", () => {
 			fs.writeFile(micPath, "mic"),
 		]);
 
-		execFileMock.mockImplementation(
-			(
-				_file: string,
-				_args: string[],
-				_options: Record<string, unknown>,
-				callback: ExecFileCallback,
-			) => {
-				const error = new Error("ffmpeg probe failed") as Error & { stderr?: string };
-				error.stderr = "Stream #0:0: Video: h264";
-				callback(error, "", error.stderr);
-			},
-		);
+		mockFfmpeg(execFileMock, {
+			videoPath,
+			embedded: { hasStream: false, maxDb: -91 },
+			sidecarMaxDb: -16,
+		});
 
 		const { getCompanionAudioFallbackPaths } = await import("./diagnostics");
 
@@ -111,20 +152,11 @@ describe("getCompanionAudioFallbackPaths", () => {
 			fs.writeFile(micPath, "mic"),
 		]);
 
-		execFileMock.mockImplementation(
-			(
-				_file: string,
-				_args: string[],
-				_options: Record<string, unknown>,
-				callback: ExecFileCallback,
-			) => {
-				const error = new Error("ffmpeg probe found embedded audio") as Error & {
-					stderr?: string;
-				};
-				error.stderr = "Stream #0:1: Audio: aac";
-				callback(error, "", error.stderr);
-			},
-		);
+		mockFfmpeg(execFileMock, {
+			videoPath,
+			embedded: { hasStream: true, maxDb: -16 },
+			sidecarMaxDb: -16,
+		});
 
 		const { getCompanionAudioFallbackPaths } = await import("./diagnostics");
 
@@ -140,20 +172,11 @@ describe("getCompanionAudioFallbackPaths", () => {
 
 		await Promise.all([fs.writeFile(videoPath, "video"), fs.writeFile(micPath, "mic")]);
 
-		execFileMock.mockImplementation(
-			(
-				_file: string,
-				_args: string[],
-				_options: Record<string, unknown>,
-				callback: ExecFileCallback,
-			) => {
-				const error = new Error("ffmpeg probe found embedded audio") as Error & {
-					stderr?: string;
-				};
-				error.stderr = "Stream #0:1: Audio: aac";
-				callback(error, "", error.stderr);
-			},
-		);
+		mockFfmpeg(execFileMock, {
+			videoPath,
+			embedded: { hasStream: true, maxDb: -16 },
+			sidecarMaxDb: -16,
+		});
 
 		const { getCompanionAudioFallbackPaths } = await import("./diagnostics");
 
@@ -170,18 +193,11 @@ describe("getCompanionAudioFallbackPaths", () => {
 			fs.writeFile(`${micPath}.json`, `\ufeff${JSON.stringify({ startDelayMs: 2750 })}`),
 		]);
 
-		execFileMock.mockImplementation(
-			(
-				_file: string,
-				_args: string[],
-				_options: Record<string, unknown>,
-				callback: ExecFileCallback,
-			) => {
-				const error = new Error("ffmpeg probe failed") as Error & { stderr?: string };
-				error.stderr = "Stream #0:0: Video: h264";
-				callback(error, "", error.stderr);
-			},
-		);
+		mockFfmpeg(execFileMock, {
+			videoPath,
+			embedded: { hasStream: false, maxDb: -91 },
+			sidecarMaxDb: -16,
+		});
 
 		const { getCompanionAudioFallbackInfo } = await import("./diagnostics");
 
@@ -191,6 +207,112 @@ describe("getCompanionAudioFallbackPaths", () => {
 				[micPath]: 2750,
 			},
 		});
+	});
+
+	it("falls back to audible sidecars when the embedded audio track is silent", async () => {
+		const videoPath = path.join(tempRoot, "recording.mp4");
+		const systemPath = path.join(tempRoot, "recording.system.m4a");
+		const micPath = path.join(tempRoot, "recording.mic.m4a");
+
+		await Promise.all([
+			fs.writeFile(videoPath, "video"),
+			fs.writeFile(systemPath, "system"),
+			fs.writeFile(micPath, "mic"),
+		]);
+
+		mockFfmpeg(execFileMock, {
+			videoPath,
+			embedded: { hasStream: true, maxDb: -91 },
+			sidecarMaxDb: -16,
+		});
+
+		const { getCompanionAudioFallbackPaths } = await import("./diagnostics");
+
+		await expect(getCompanionAudioFallbackPaths(videoPath)).resolves.toEqual([
+			systemPath,
+			micPath,
+		]);
+	});
+
+	it("drops a silent system sidecar and keeps the audible mic sidecar on macOS", async () => {
+		const videoPath = path.join(tempRoot, "recording.mp4");
+		const systemPath = path.join(tempRoot, "recording.system.m4a");
+		const micPath = path.join(tempRoot, "recording.mic.m4a");
+
+		await Promise.all([
+			fs.writeFile(videoPath, "video"),
+			fs.writeFile(systemPath, "system"),
+			fs.writeFile(micPath, "mic"),
+		]);
+
+		execFileMock.mockImplementation(
+			(_file: string, args: string[], _options: Record<string, unknown>, callback: ExecFileCallback) => {
+				const inputIndex = args.indexOf("-i");
+				const inputPath = inputIndex >= 0 ? args[inputIndex + 1] : undefined;
+				let stderr: string;
+
+				if (inputPath === videoPath) {
+					stderr = ["Stream #0:1: Audio: aac", volumedetectStderr(-91, -91)].join("\n");
+				} else if (inputPath === systemPath) {
+					stderr = volumedetectStderr(-91, -91);
+				} else {
+					stderr = volumedetectStderr(-35, -16);
+				}
+
+				callback(ffmpegProbeResponse(stderr), "", stderr);
+			},
+		);
+
+		const { getCompanionAudioFallbackPaths } = await import("./diagnostics");
+
+		await expect(getCompanionAudioFallbackPaths(videoPath)).resolves.toEqual([micPath]);
+	});
+
+	it("prefers macOS sidecars over the embedded mix when both system and mic sidecars are audible", async () => {
+		const videoPath = path.join(tempRoot, "recording.mp4");
+		const systemPath = path.join(tempRoot, "recording.system.m4a");
+		const micPath = path.join(tempRoot, "recording.mic.m4a");
+
+		await Promise.all([
+			fs.writeFile(videoPath, "video"),
+			fs.writeFile(systemPath, "system"),
+			fs.writeFile(micPath, "mic"),
+		]);
+
+		mockFfmpeg(execFileMock, {
+			videoPath,
+			embedded: { hasStream: true, maxDb: -16 },
+			sidecarMaxDb: -16,
+		});
+
+		const { getCompanionAudioFallbackPaths } = await import("./diagnostics");
+
+		await expect(getCompanionAudioFallbackPaths(videoPath)).resolves.toEqual([
+			systemPath,
+			micPath,
+		]);
+	});
+
+	it("keeps the embedded audio when all companion sidecars are silent", async () => {
+		const videoPath = path.join(tempRoot, "recording.mp4");
+		const systemPath = path.join(tempRoot, "recording.system.m4a");
+		const micPath = path.join(tempRoot, "recording.mic.m4a");
+
+		await Promise.all([
+			fs.writeFile(videoPath, "video"),
+			fs.writeFile(systemPath, "system"),
+			fs.writeFile(micPath, "mic"),
+		]);
+
+		mockFfmpeg(execFileMock, {
+			videoPath,
+			embedded: { hasStream: true, maxDb: -16 },
+			sidecarMaxDb: -91,
+		});
+
+		const { getCompanionAudioFallbackPaths } = await import("./diagnostics");
+
+		await expect(getCompanionAudioFallbackPaths(videoPath)).resolves.toEqual([videoPath]);
 	});
 
 	it("scales audio mux timeout for long recordings", async () => {

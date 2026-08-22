@@ -68,8 +68,8 @@
       "NSAudioCaptureUsageDescription": "Recordly needs audio capture permission to record system audio.",
       "NSCameraUsageDescription": "Recordly needs camera access to record webcam video.",
       "NSMicrophoneUsageDescription": "Recordly needs microphone access to record voice audio.",
+      "NSScreenCaptureUsageDescription": "Recordly needs screen and system audio recording permission to capture your screen.",
       "NSCameraUseContinuityCameraDeviceType": true,
-      "com.apple.security.device.audio-input": true,
       "CFBundleDocumentTypes": [
         {
           "CFBundleTypeName": "Recordly Project",
