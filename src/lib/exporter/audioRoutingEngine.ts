@@ -121,7 +121,12 @@ export function buildResolvedAudioPlan(input: {
 		hasEmbeddedSourceAudio,
 		pathsByTrack,
 		playbackPaths,
-		muteEmbeddedPreview: hasDedicatedTracks && !includeEmbeddedInExport,
+		// Always mute the embedded preview when a dedicated sidecar is being used.
+		// On macOS the inline audio track contains system audio when a system sidecar
+		// exists, but contains microphone audio when only a microphone sidecar exists.
+		// Playing both the embedded mix and the mic sidecar in preview produces an
+		// audible echo, so we prefer the split sidecars for preview.
+		muteEmbeddedPreview: hasDedicatedTracks,
 		includeEmbeddedInExport,
 		tracks,
 		masterGain: clampGain(input.masterGain ?? 1, 1),
